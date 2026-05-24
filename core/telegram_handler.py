@@ -298,7 +298,7 @@ async def _process_request(chat_id, user_input, origin_message=None):
     final_stats = final_stats or stats_from_stream
 
     # Final text flush
-    await flush_text()
+    # await flush_text()
     
     conv_logger.info(f"AGENT [{chat_id}]: {full_response}")
     if "[VOICE_TRANSCRIPTION]" in user_input and full_response:
