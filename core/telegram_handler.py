@@ -70,6 +70,8 @@ def is_not_user(update: Update) -> bool:
 
 async def _handle_attachments(message: Message) -> str:
     user_input = message.text or ""
+    caption = message.caption or ""
+    
     if message.voice or message.audio:
         try:
             audio_obj = await (message.voice or message.audio).get_file()
@@ -77,15 +79,29 @@ async def _handle_attachments(message: Message) -> str:
             await audio_obj.download_to_drive(audio_path)
             result = WHISPER_MODEL.transcribe(audio_path, language="fr")
             transcription = result.get("text", "").strip()
-            if transcription: user_input = f"{transcription}\n[VOICE_TRANSCRIPTION]"
+            
+            # Combine transcription with existing input or caption
+            parts = []
+            if transcription: parts.append(f"{transcription}\n[VOICE_TRANSCRIPTION]")
+            if caption: parts.append(caption)
+            if user_input and user_input != caption: parts.append(user_input)
+            user_input = "\n\n".join(parts)
         except Exception as e: logger.error(f"STT Error: {e}")
         return user_input
-    if not (message.photo or message.document): return user_input
+
+    if not (message.photo or message.document): 
+        return user_input or caption
+
     try:
-        file_obj = await (message.photo[-1] if message.photo else message.document).get_file()
-        file_path = os.path.join(TMP_DIR, file_obj.file_path.split('/')[-1])
+        is_photo = bool(message.photo)
+        file_obj = await (message.photo[-1] if is_photo else message.document).get_file()
+        
+        # Try to get original filename for documents
+        orig_name = message.document.file_name if message.document else file_obj.file_path.split('/')[-1]
+        file_path = os.path.join(TMP_DIR, orig_name)
+        
         await file_obj.download_to_drive(file_path)
-        user_input = f"{message.caption or 'Analysis'}\n[FILE: {file_path}]"
+        user_input = f"{caption or 'Analysis'}\n[FILE: {file_path}]"
     except Exception as e: logger.error(f"File Error: {e}")
     return user_input
 
@@ -99,17 +115,34 @@ def _get_clean_user_text(text: str) -> str:
 
 
 def _format_html_response(text: str) -> str:
-    clean_text = _get_clean_user_text(text)
-    if not clean_text: return ""
-    clean_text = clean_text.replace("<b>", "[[B]]").replace("</b>", "[[/B]]").replace("<i>", "[[I]]").replace("</i>", "[[/I]]").replace("<code>", "[[C]]").replace("</code>", "[[/C]]").replace("<pre>", "[[P]]").replace("</pre>", "[[/P]]")
-    clean_text = html.escape(clean_text)
-    clean_text = clean_text.replace("[[B]]", "<b>").replace("[[/B]]", "</b>").replace("[[I]]", "<i>").replace("[[/I]]", "</i>").replace("[[C]]", "<code>").replace("[[/C]]", "</code>").replace("[[P]]", "<pre>").replace("[[/P]]", "</pre>")
-    clean_text = re.sub(r"^[ \t]*#{1,6}\s*(.*?)[ \t]*$", r"<b>\1</b>", clean_text, flags=re.MULTILINE)
-    clean_text = re.sub(r"```(?:[\w]+)?\n?(.*?)```", r"<code>\1</code>", clean_text, flags=re.DOTALL)
-    clean_text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", clean_text)
-    clean_text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"<i>\1</i>", clean_text)
-    clean_text = re.sub(r"`(.*?)`", r"<code>\1</code>", clean_text)
-    return clean_text.strip()
+    """Safe formatting for Telegram HTML, protecting code blocks."""
+    if not text: return ""
+    
+    # Protect code blocks
+    placeholders = []
+    def save_code(match):
+        content = match.group(1)
+        safe_content = html.escape(content)
+        placeholders.append(f"<code>{safe_content}</code>")
+        return f"[[CODE_BLOCK_{len(placeholders)-1}]]"
+    
+    # Blocks and inline code
+    text = re.sub(r"```(?:[\w]+)?\n?(.*?)```", save_code, text, flags=re.DOTALL)
+    text = re.sub(r"`(.*?)`", save_code, text)
+
+    # Escape everything else
+    text = html.escape(text)
+
+    # Basic formatting
+    text = re.sub(r"^[ \t]*#{1,6}\s*(.*?)[ \t]*$", r"<b>\1</b>", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+
+    # Restore code
+    for i, placeholder in enumerate(placeholders):
+        text = text.replace(f"[[CODE_BLOCK_{i}]]", placeholder)
+
+    return text.strip()
 
 
 async def _reply_with_voice(chat_id, text: str, reply_to_message_id=None):
@@ -143,6 +176,7 @@ async def _process_request(chat_id, user_input, origin_message=None):
     
     async def send_msg(text, silent=True, noisy=False):
         """Robust permanent delivery with retry."""
+        if not text or not text.strip(): return None
         disable_notif = silent if not noisy else False
         for attempt in range(3):
             try:
@@ -151,14 +185,17 @@ async def _process_request(chat_id, user_input, origin_message=None):
             except Exception as e:
                 if attempt == 2:
                     logger.error(f"TG Send Error: {e}")
-                    if origin_message: return await origin_message.reply_text(text[:4000])
-                    return await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=text[:4000])
+                    # Fallback to plain text if HTML fails
+                    plain = re.sub(r'<[^>]+>', '', text)
+                    if origin_message: return await origin_message.reply_text(plain[:4000])
+                    return await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=plain[:4000])
                 await asyncio.sleep(1)
 
     # Thinking cursor
     cursor_msg = await send_msg("🤔 <b>Thinking...</b>", silent=True)
 
-    current_buffer, full_response = "", ""
+    full_response = ""
+    sent_upto = 0
     active_tools = {} # tid -> {header, output}
     final_stats = None
 
@@ -169,6 +206,15 @@ async def _process_request(chat_id, user_input, origin_message=None):
         cursor_msg = await send_msg("🤔 <b>Thinking...</b>", silent=True)
         try: await old.delete()
         except: pass
+
+    async def flush_text():
+        """Sends unsent part of full_response."""
+        nonlocal sent_upto
+        to_send = full_response[sent_upto:].strip()
+        if to_send:
+            await send_msg(_format_html_response(to_send))
+            sent_upto = len(full_response)
+            await rotate_cursor()
 
     async def handle_images(text):
         matches = list(re.finditer(r"\[SEND_IMAGE:\s*(.*?)\]", text, re.IGNORECASE))
@@ -184,20 +230,15 @@ async def _process_request(chat_id, user_input, origin_message=None):
                 except: pass
 
     async def callback(e_type, e_data):
-        nonlocal current_buffer, full_response, cursor_msg, active_tools, final_stats
+        nonlocal full_response, cursor_msg, active_tools, final_stats
         if STOP_SIGNAL.get(chat_id): return
 
         if e_type == "message" and e_data.get("role") == "assistant":
             content = e_data.get("content", "")
-            if not content: return
-            current_buffer += content
-            full_response += content
+            if content: full_response += content
 
         elif e_type == "tool_use":
-            if current_buffer.strip():
-                await send_msg(_format_html_response(current_buffer))
-                await rotate_cursor()
-            current_buffer = ""
+            await flush_text()
             clear_live_buffer(chat_id)
             
             name = e_data.get("tool_name") or e_data.get("name") or "tool"
@@ -256,9 +297,8 @@ async def _process_request(chat_id, user_input, origin_message=None):
     exit_code, stats_from_stream = await call_gemini_stream(user_input, chat_id, callback)
     final_stats = final_stats or stats_from_stream
 
-    # Final assistant text
-    if current_buffer.strip():
-        await send_msg(_format_html_response(current_buffer))
+    # Final text flush
+    await flush_text()
     
     conv_logger.info(f"AGENT [{chat_id}]: {full_response}")
     if "[VOICE_TRANSCRIPTION]" in user_input and full_response:
